@@ -19,23 +19,98 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         this.at = at;
     }
 
+    protected boolean traceStackFrame = false;
+
+    protected boolean traceFunctionCall = false;
+
     ///////////////////////////////////////////////////////////
     /// 栈桢的管理
     private Stack<StackFrame> stack = new Stack<StackFrame>();
 
-    public void pushStack(StackFrame frame) {
-        // 如果新加入的frame是当前frame的下一级，则入栈
+    /**
+     * 栈桢入栈。
+     * 其中最重要的任务，是要保证栈桢的parentFrame设置正确。否则，
+     * (1)随着栈的变深，查找变量的性能会降低；
+     * (2)甚至有可能找错栈桢，比如在递归(直接或间接)的场景下。
+     * @param frame
+     */
+    private void pushStack(StackFrame frame) {
         if (stack.size() > 0) {
-            if (frame.scope.enclosingScope == stack.peek().scope) {
-                frame.parentFrame = stack.peek();
+            //从栈顶到栈底依次查找
+            for (int i = stack.size()-1; i>0; i--){
+                StackFrame f = stack.get(i);
+
+                /*
+                如果新加入的栈桢，跟某个已有的栈桢的enclosingScope是一样的，那么这俩的parentFrame也一样。
+                因为它们原本就是同一级的嘛。
+                比如：
+                void foo(){};
+                void bar(foo());
+
+                或者：
+                void foo();
+                if (...){
+                    foo();
+                }
+                */
+                if (f.scope.enclosingScope == frame.scope.enclosingScope){
+                    frame.parentFrame = f.parentFrame;
+                    break;
+                }
+
+                /*
+                如果新加入的栈桢，是某个已有的栈桢的下一级，那么就把把这个父子关系建立起来。比如：
+                void foo(){
+                    if (...){  //把这个块往栈桢里加的时候，就符合这个条件。
+                    }
+                }
+                再比如,下面的例子:
+                class MyClass{
+                    void foo();
+                }
+                MyClass c = MyClass();  //先加Class的栈桢，里面有类的属性，包括父类的
+                c.foo();                //再加foo()的栈桢
+                 */
+                else if (f.scope == frame.scope.enclosingScope){
+                    frame.parentFrame = f;
+                    break;
+                }
+
+                /*
+                这是针对函数可能是一等公民的情况。这个时候，函数运行时的作用域，与声明时的作用域会不一致。
+                我在这里设计了一个“receiver”的机制，意思是这个函数是被哪个变量接收了。要按照这个receiver的作用域来判断。
+                 */
+                else if (frame.object instanceof FunctionObject){
+                    FunctionObject functionObject = (FunctionObject)frame.object;
+                    if (functionObject.receiver != null && functionObject.receiver.enclosingScope == f.scope) {
+                        frame.parentFrame = f;
+                        break;
+                    }
+                }
             }
-            // 否则，跟栈顶元素的parentFrame相同
-            else {
-                frame.parentFrame = stack.peek().parentFrame;
+
+            if (frame.parentFrame == null){
+                frame.parentFrame = stack.peek();
             }
         }
 
         stack.push(frame);
+
+        if (traceStackFrame){
+            dumpStackFrame();
+        }
+    }
+
+    private void popStack(){
+        stack.pop();
+    }
+
+    private void dumpStackFrame(){
+        System.out.println("\nStack Frames ----------------");
+        for (StackFrame frame : stack){
+            System.out.println(frame);
+        }
+        System.out.println("-----------------------------\n");
     }
 
     public LValue getLValue(Variable variable) {
@@ -43,7 +118,7 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
 
         PlayObject valueContainer = null;
         while (f != null) {
-            if (f.scope.containsSymbol(variable)) {
+            if (f.scope.containsSymbol(variable)) { //对于对象来说，会查找所有父类的属性
                 valueContainer = f.object;
                 break;
             }
@@ -69,20 +144,42 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
     }
 
 
-    /**
-     * 从栈顶开始，找到第一个ClassObject
-     * 在调用类的方法时，需要找到实际的类。
-     * @return
-     */
-    private ClassObject firstClassObjectInStack(){
+    ///////////////////////////////////////////////
+    //为闭包获取环境变量的值
 
-        for (int i= stack.size()-1; i>0; i--){
-            StackFrame stackFrame = stack.get(i);
-            if (stackFrame.object instanceof ClassObject){
-                return (ClassObject) stackFrame.object;
+    /**
+     * 为闭包获取环境变量的值
+     * @param function 闭包所关联的函数。这个函数会访问一些环境变量。
+     * @param valueContainer 存放环境变量的值的容器
+     */
+    private void getClosureValues(Function function, PlayObject valueContainer){
+        if (function.closureVariables != null) {
+            for (Variable var : function.closureVariables) {
+                LValue lValue = getLValue(var); // 现在还可以从栈里取，退出函数以后就不行了
+                Object value = lValue.getValue();
+                valueContainer.fields.put(var, value);
             }
         }
-        return null;
+    }
+
+    /**
+     * 为从函数中返回的对象设置闭包值。因为多个函数型属性可能共享值，所以要打包到ClassObject中，而不是functionObject中
+     * @param classObject
+     */
+    private void getClosureValues(ClassObject classObject){
+        //先放在一个临时对象里，避免对classObject即读又写
+        PlayObject tempObject = new PlayObject();
+        for ( Variable v : classObject.fields.keySet()) {
+            if (v.type instanceof FunctionType) {
+                Object object = classObject.fields.get(v);
+                if (object != null) {
+                    FunctionObject functionObject = (FunctionObject) object;
+                    getClosureValues(functionObject.function, tempObject);
+                }
+            }
+        }
+
+        classObject.fields.putAll(tempObject.fields);
     }
 
 
@@ -100,12 +197,22 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
 
         @Override
         public Object getValue() {
+            //对于this或super关键字，直接返回这个对象，应该是ClassObject
+            if (variable instanceof This || variable instanceof Super){
+                return valueContainer;
+            }
+
             return valueContainer.getValue(variable);
         }
 
         @Override
         public void setValue(Object value) {
             valueContainer.setValue(variable, value);
+
+            //如果variable是函数型变量，那改变functionObject.receiver
+            if (value instanceof FunctionObject){
+                ((FunctionObject) value).receiver = (Variable)variable;
+            }
         }
 
         @Override
@@ -127,7 +234,7 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
     ///////////////////////////////////////////////////////////
     /// 对象初始化
 
-    // 模拟在堆中申请空间，来保存对象
+    //从父类到子类层层执行缺省的初始化方法，即不带参数的初始化方法。
     protected ClassObject createAndInitClassObject(Class theClass) {
         ClassObject obj = new ClassObject();
         obj.type = theClass;
@@ -148,7 +255,7 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
             Class c = ancestorChain.pop();
             defaultObjectInit(c, obj);
         }
-        stack.pop();
+        popStack();
 
         return obj;
     }
@@ -165,6 +272,9 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         // 执行缺省初始化
         ClassBodyContext ctx = ((ClassDeclarationContext) theClass.ctx).classBody();
         visitClassBody(ctx);
+
+        //TODO 其实这里还没干完活。还需要调用显式声明的构造方法
+
     }
 
 
@@ -367,7 +477,7 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         Object rtn = visitBlockStatements(ctx.blockStatements());
 
         if (scope !=null) {
-            stack.pop();
+            popStack();
         }
 
         return rtn;
@@ -382,11 +492,6 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
             rtn = visitStatement(ctx.statement());
         }
         return rtn;
-    }
-
-    @Override
-    public Object visitEnhancedForControl(EnhancedForControlContext ctx) {
-        return super.visitEnhancedForControl(ctx);
     }
 
     @Override
@@ -471,16 +576,25 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
                 Object value = ((LValue) leftObject).getValue();
                 if (value instanceof ClassObject) {
                     ClassObject valueContainer = (ClassObject) value;
+                    Variable leftVar = (Variable)at.symbolOfNode.get(ctx.expression(0));
                     // 获得field或调用方法
                     if (ctx.IDENTIFIER() != null) {
                         Variable variable = (Variable) at.symbolOfNode.get(ctx);
-                        //类的成员可能需要重载
-                        Variable overloaded = at.lookupVariable(valueContainer.type, variable.getName());
-                        LValue lValue = new MyLValue(valueContainer, overloaded);
+
+                        //对于this和super引用的属性，不用考虑重载，因为它们的解析是准确的
+                        if (!(leftVar instanceof This || leftVar instanceof Super)) {
+                            //类的成员可能需要重载
+                            variable = at.lookupVariable(valueContainer.type, variable.getName());
+                        }
+                        LValue lValue = new MyLValue(valueContainer, variable);
                         rtn = lValue;
                     } else if (ctx.functionCall() != null) {
                         //要先计算方法的参数，才能加对象的StackFrame.
-                        rtn = methodCall(valueContainer, ctx.functionCall());
+                        if (traceFunctionCall){
+                            System.out.println("\n>>MethodCall : " + ctx.getText());
+                        }
+
+                        rtn = methodCall(valueContainer, ctx.functionCall(), (leftVar instanceof Super));
                     }
                 }
             } else {
@@ -663,6 +777,17 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         else if (ctx.expression() != null){
             rtn = visitExpression(ctx.expression());
         }
+        //this
+        else if (ctx.THIS() != null){
+            This thisRef = (This)at.symbolOfNode.get(ctx);
+            rtn = getLValue(thisRef);
+        }
+        //super
+        else if (ctx.SUPER() != null){
+            Super superRef = (Super) at.symbolOfNode.get(ctx);
+            rtn = getLValue(superRef);
+        }
+
         return rtn;
     }
 
@@ -794,7 +919,7 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
             }
 
             // 去掉StackFrame
-            stack.pop();
+            popStack();
         }
 
         //block
@@ -813,18 +938,20 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
             if (ctx.expression() != null) {
                 rtn = visitExpression(ctx.expression());
 
+                //return语句应该不需要左值   //TODO 取左值的场景需要优化，目前都是取左值。
+                if (rtn instanceof LValue){
+                    rtn = ((LValue)rtn).getValue();
+                }
+
                 // 把闭包涉及的环境变量都打包带走
                 if (rtn instanceof FunctionObject) {
                     FunctionObject functionObject = (FunctionObject) rtn;
-                    if (functionObject.function.closureVariables != null) {
-                        for (Variable var : functionObject.function.closureVariables) {
-                            LValue lValue = getLValue(var); // 现在还可以从栈里取，退出函数以后就不行了
-                            Object value = lValue.getValue();
-                            if (value != null) {
-                                functionObject.fields.put(var, value);
-                            }
-                        }
-                    }
+                    getClosureValues(functionObject.function, functionObject);
+                }
+                //如果返回的是一个对象，那么检查它的所有属性里有没有是闭包的。//TODO 如果属性仍然是一个对象，可能就要向下递归查找了。
+                else if (rtn instanceof ClassObject){
+                    ClassObject classObject = (ClassObject)rtn;
+                    getClosureValues(classObject);
                 }
 
             }
@@ -833,21 +960,6 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
             rtn = new ReturnObject(rtn);
         }
         return rtn;
-    }
-
-    @Override
-    public Object visitSuperSuffix(SuperSuffixContext ctx) {
-        return super.visitSuperSuffix(ctx);
-    }
-
-    @Override
-    public Object visitSwitchBlockStatementGroup(SwitchBlockStatementGroupContext ctx) {
-        return super.visitSwitchBlockStatementGroup(ctx);
-    }
-
-    @Override
-    public Object visitSwitchLabel(SwitchLabelContext ctx) {
-        return super.visitSwitchLabel(ctx);
     }
 
     @Override
@@ -923,29 +1035,25 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
 
         rtn = visitBlockStatements(ctx.blockStatements());
 
-        stack.pop();
+        popStack();
 
         return rtn;
     }
 
     @Override
-    public Object visitFormalParameter(FormalParameterContext ctx) {
-        return super.visitFormalParameter(ctx);
-    }
-
-    @Override
-    public Object visitFormalParameterList(FormalParameterListContext ctx) {
-        return super.visitFormalParameterList(ctx);
-    }
-
-    @Override
-    public Object visitFormalParameters(FormalParametersContext ctx) {
-        return super.visitFormalParameters(ctx);
-    }
-
-    @Override
     public Object visitFunctionCall(FunctionCallContext ctx) {
-        if (ctx.IDENTIFIER() == null) return null;  //暂时不支持this和super
+        //this
+        if (ctx.THIS() != null){
+            thisConstructor(ctx);
+            return null;  //不需要有返回值，因为本身就是在构造方法里调用的。
+        }
+        //super
+        else if (ctx.SUPER() != null){
+            thisConstructor(ctx); //似乎跟this完全一样。因为方法的绑定是解析准确了的。
+            return null;
+        }
+
+        //if (ctx.IDENTIFIER() == null) return null;  //暂时不支持this和super
 
         Object rtn = null;
 
@@ -953,9 +1061,11 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
 
         //如果调用的是类的缺省构造函数，则直接创建对象并返回
         Symbol symbol = at.symbolOfNode.get(ctx);
-        if (symbol instanceof Class) {
+        //if (symbol instanceof Class) {
+        if (symbol instanceof DefaultConstructor) {
             //类的缺省构造函数。没有一个具体函数跟它关联，只是指向了一个类。
-            return createAndInitClassObject((Class) symbol);  //返回新创建的对象
+            //return createAndInitClassObject((Class) symbol);  //返回新创建的对象
+            return createAndInitClassObject(((DefaultConstructor)symbol).Class());  //返回新创建的对象
         }
         //硬编码的一些函数
         else if(functionName.equals("println")){
@@ -968,23 +1078,24 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         FunctionObject functionObject = getFuntionObject(ctx);
         Function function = functionObject.function;
 
-        //如果是对象的构造方法，则按照对象方法掉用去执行，并返回所创建出的对象。
-        if (function.enclosingScope instanceof Class) {
+        //如果是对象的构造方法，则按照对象方法调用去执行，并返回所创建出的对象。
+        if (function.isConstructor()) {
             Class theClass = (Class) function.enclosingScope;
 
-            if (theClass.name.equals(function.name)) {
-                ClassObject newObject = createAndInitClassObject(theClass);  //先做缺省的初始化
+            ClassObject newObject = createAndInitClassObject(theClass);  //先做缺省的初始化
 
-                methodCall(newObject, ctx);
+            methodCall(newObject, ctx, false);
 
-                return  newObject;  //返回新创建的对象。
-            }
+            return  newObject;  //返回新创建的对象。
         }
 
         //计算参数值
         List<Object> paramValues = calcParamValues(ctx);
 
-        //执行函数调用
+        if (traceFunctionCall){
+            System.out.println("\n>>FunctionCall : " + ctx.getText());
+        }
+
         rtn = functionCall(functionObject, paramValues);
 
         return rtn;
@@ -1051,6 +1162,7 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         return functionObject;
     }
 
+
     /**
      * 执行一个函数的方法体。需要先设置参数值，然后再执行代码。
      * @param functionObject
@@ -1078,7 +1190,7 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         rtn = visitFunctionDeclaration(functionCode);
 
         // 弹出StackFrame
-        stack.pop(); //函数的栈桢
+        popStack(); //函数的栈桢
 
         //如果由一个return语句返回，真实返回值会被封装在一个ReturnObject里。
         if (rtn instanceof ReturnObject){
@@ -1097,16 +1209,23 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
      * @param ctx
      * @return
      */
-    private Object methodCall(ClassObject classObject, FunctionCallContext ctx){
+    private Object methodCall(ClassObject classObject, FunctionCallContext ctx, boolean isSuper){
         Object rtn = null;
 
         //查找函数，并根据需要创建FunctionObject
+        //如果查找到的是类的属性，FunctionType型的，需要把在对象的栈桢里查。
+        StackFrame classFrame = new StackFrame(classObject);
+        pushStack(classFrame);
+
         FunctionObject funtionObject = getFuntionObject(ctx);
+
+        popStack();
+
         Function function = funtionObject.function;
 
         //对普通的类方法，需要在运行时动态绑定
         Class theClass = classObject.type;   //这是从对象获得的类型，是真实类型。可能是变量声明时的类型的子类
-        if (!theClass.name.equals(function.name)) {
+        if (!function.isConstructor() && !isSuper) {
             //从当前类逐级向上查找，找到正确的方法定义
             Function overrided = theClass.getFunction(function.name, function.getParamTypes());
             //原来这个function，可能指向一个父类的实现。现在从子类中可能找到重载后的方法，这个时候要绑定到子类的方法上
@@ -1120,24 +1239,38 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         List<Object> paramValues = calcParamValues(ctx);
 
         //对象的frame要等到函数参数都计算完了才能添加。
-        StackFrame classFrame = new StackFrame(classObject);
+        //StackFrame classFrame = new StackFrame(classObject);
         pushStack(classFrame);
 
         //执行函数
         rtn = functionCall(funtionObject, paramValues);
 
         //弹出栈桢
-        stack.pop();
+        popStack();
 
         return rtn;
+    }
+
+    private void thisConstructor(FunctionCallContext ctx){
+        Symbol symbol = at.symbolOfNode.get(ctx);
+        //if (symbol instanceof Class){  //缺省构造函数
+        if (symbol instanceof DefaultConstructor){  //缺省构造函数
+            return; //这里不用管，因为缺省构造函数一定会被调用。
+        }
+        else if (symbol instanceof Function) {
+            Function function = (Function) symbol;
+            FunctionObject functionObject = new FunctionObject(function);
+
+            List<Object> paramValues = calcParamValues(ctx);
+
+            functionCall(functionObject, paramValues);
+        }
     }
 
 
     @Override
     public Object visitFunctionDeclaration(FunctionDeclarationContext ctx) {
-        Object rtn = null;
-        rtn = visitFunctionBody(ctx.functionBody());
-        return rtn;
+        return visitFunctionBody(ctx.functionBody());
     }
 
     @Override
@@ -1149,20 +1282,6 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         return rtn;
     }
 
-    @Override
-    public Object visitQualifiedName(QualifiedNameContext ctx) {
-        return super.visitQualifiedName(ctx);
-    }
-
-    @Override
-    public Object visitQualifiedNameList(QualifiedNameListContext ctx) {
-        return super.visitQualifiedNameList(ctx);
-    }
-
-    @Override
-    public Object visitTypeTypeOrVoid(TypeTypeOrVoidContext ctx) {
-        return super.visitTypeTypeOrVoid(ctx);
-    }
 
     @Override
     public Object visitClassBody(ClassBodyContext ctx) {
@@ -1200,34 +1319,5 @@ public class ASTEvaluator extends PlayScriptBaseVisitor<Object> {
         return rtn;
     }
 
-    @Override
-    public Object visitClassDeclaration(ClassDeclarationContext ctx) {
-        return super.visitClassDeclaration(ctx);
-    }
-
-    @Override
-    public Object visitConstructorDeclaration(ConstructorDeclarationContext ctx) {
-        return super.visitConstructorDeclaration(ctx);
-    }
-
-    @Override
-    public Object visitCreator(CreatorContext ctx) {
-        return super.visitCreator(ctx);
-    }
-
-    @Override
-    public Object visitTypeArgument(TypeArgumentContext ctx) {
-        return super.visitTypeArgument(ctx);
-    }
-
-    @Override
-    public Object visitTypeList(TypeListContext ctx) {
-        return super.visitTypeList(ctx);
-    }
-
-    @Override
-    public Object visitVariableModifier(VariableModifierContext ctx) {
-        return super.visitVariableModifier(ctx);
-    }
 
 }

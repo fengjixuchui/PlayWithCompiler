@@ -36,10 +36,16 @@ public class AnnotatedTree {
     //语义分析过程中生成的信息，包括普通信息、警告和错误
     protected List<CompilationLog> logs = new LinkedList<CompilationLog>();
 
+    //在构造函数里,引用的this()。第二个函数是被调用的构造函数
+    protected Map<Function, Function> thisConstructorRef = new HashMap<>();
+
+    //在构造函数里,引用的super()。第二个函数是被调用的构造函数
+    protected Map<Function, Function> superConstructorRef = new HashMap<>();
+
+
     protected AnnotatedTree() {
 
     }
-
 
     /**
      * 记录编译错误和警告
@@ -139,11 +145,28 @@ public class AnnotatedTree {
     }
 
     /**
-     * 逐级查找函数（或方法）。仅通过名字查找。如果有重名的，返回第一个就算了。//TODO 未来应该报警。
+     * 查找函数型变量，逐级查找。
      * @param scope
-     * @param name
+     * @param idName
+     * @param paramTypes
      * @return
      */
+    protected Variable lookupFunctionVariable(Scope scope, String idName, List<Type> paramTypes) {
+        Variable rtn = scope.getFunctionVariable(idName, paramTypes);
+
+        if (rtn == null && scope.enclosingScope != null) {
+            rtn = lookupFunctionVariable(scope.enclosingScope, idName, paramTypes);
+        }
+        return rtn;
+    }
+
+
+        /**
+         * 逐级查找函数（或方法）。仅通过名字查找。如果有重名的，返回第一个就算了。//TODO 未来应该报警。
+         * @param scope
+         * @param name
+         * @return
+         */
     protected Function lookupFunction(Scope scope, String name){
         Function rtn = null;
         if (scope instanceof Class){
@@ -202,6 +225,35 @@ public class AnnotatedTree {
         return rtn;
     }
 
+    /**
+     * 包含某节点的函数
+     * @param ctx
+     * @return
+     */
+    public Function enclosingFunctionOfNode(RuleContext ctx){
+        if (ctx.parent instanceof PlayScriptParser.FunctionDeclarationContext){
+            return (Function) node2Scope.get(ctx.parent);
+        }
+        else if (ctx.parent == null){
+            return null;
+        }
+        else return enclosingFunctionOfNode(ctx.parent);
+    }
+
+    /**
+     * 包含某节点的类
+     * @param ctx
+     * @return
+     */
+    public Class enclosingClassOfNode(RuleContext ctx){
+        if (ctx.parent instanceof PlayScriptParser.ClassDeclarationContext){
+            return (Class) node2Scope.get(ctx.parent);
+        }
+        else if (ctx.parent == null){
+            return null;
+        }
+        else return enclosingClassOfNode(ctx.parent);
+    }
 
     /**
      * 输出本Scope中的内容，包括每个变量的名称、类型。

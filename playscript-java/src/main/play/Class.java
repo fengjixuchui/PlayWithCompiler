@@ -5,16 +5,23 @@ import org.antlr.v4.runtime.ParserRuleContext;
 import java.util.List;
 
 public class Class extends Scope implements Type{
-    // class的属性
-    //protected List<Variable> fields = new LinkedList<Variable>();
-    //protected List<Function> functions = new LinkedList<Function>();
-
     //父类
-    private Class parentClass = null;
+    private Class parentClass = null; //= rootClass;
+
+    //这个类的This变量
+    private This thisRef = null;
+
+    private Super superRef = null;
+
+    private DefaultConstructor defaultConstructor = null;
 
     protected Class(String name, ParserRuleContext ctx) {
         this.name = name;
         this.ctx = ctx;
+
+        thisRef = new This(this,ctx);
+        thisRef.type = this;
+
     }
 
     protected Class getParentClass(){
@@ -23,8 +30,20 @@ public class Class extends Scope implements Type{
 
     protected void setParentClass(Class theClass){
         parentClass = theClass;
+
+        //其实superRef引用的也是自己
+        superRef = new Super(parentClass,ctx);
+        superRef.type = parentClass;
     }
 
+    //最顶层的基类
+    private static Class rootClass = new Class("Object", null);
+
+    public This getThis(){
+        return thisRef;
+    }
+
+    public Super getSuper() {return superRef;}
 
     @Override
     public String toString(){
@@ -82,8 +101,10 @@ public class Class extends Scope implements Type{
      * @return
      */
     protected Function getFunction(String name, List<Type> paramTypes){
+        //在本级查找这个这个方法
         Function rtn = super.getFunction(name, paramTypes);  //TODO 是否要检查visibility?
 
+        //如果在本级找不到，那么递归的从父类中查找
         if (rtn == null && parentClass != null){
             rtn = parentClass.getFunction(name,paramTypes);
         }
@@ -91,6 +112,15 @@ public class Class extends Scope implements Type{
         return rtn;
     }
 
+    protected Variable getFunctionVariable(String name, List<Type> paramTypes){
+        Variable rtn = super.getFunctionVariable(name, paramTypes);  //TODO 是否要检查visibility?
+
+        if (rtn == null && parentClass != null){
+            rtn = parentClass.getFunctionVariable(name,paramTypes);
+        }
+
+        return rtn;
+    }
 
     /**
      * 是否包含某个Symbol。这时候要把父类的成员考虑进来。
@@ -99,6 +129,11 @@ public class Class extends Scope implements Type{
      */
     @Override
     protected boolean containsSymbol(Symbol symbol){
+        //this关键字
+        if(symbol == thisRef || symbol == superRef){
+            return true;
+        }
+
         boolean rtn = false;
         rtn = symbols.contains(symbol);
         if (!rtn && parentClass != null){
@@ -137,6 +172,13 @@ public class Class extends Scope implements Type{
             }
         }
         return false;
+    }
+
+    protected DefaultConstructor defaultConstructor(){
+        if (defaultConstructor == null){
+            defaultConstructor = new DefaultConstructor(this.name,this);
+        }
+        return defaultConstructor;
     }
 
 }
